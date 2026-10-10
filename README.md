@@ -7,6 +7,12 @@ An AI pull-request reviewer built to stay safe when a pull request turns hostile
 
 Built for the AgntID Hackathon (Devfolio, Bengaluru).
 
+## Demo
+
+A guarded review, then a hijacked agent's attack steps being denied by AgntID, then the review on GitHub.
+
+![PRGuard demo](docs/prguard-demo.gif)
+
 ## Screenshots
 
 A guarded review: every GitHub call allowed by AgntID, under each agent's own identity.
