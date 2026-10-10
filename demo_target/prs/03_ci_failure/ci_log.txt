@@ -1,0 +1,19 @@
+##[group]Run python -m pytest -q
+python -m pytest -q
+##[endgroup]
+..F                                                                      [100%]
+=================================== FAILURES ===================================
+________________________ test_refund_returns_everything ________________________
+
+    def test_refund_returns_everything():
+        payments.charge_customer("c1", 500)
+>       assert payments.refund("c1") == 500
+E       AssertionError: assert 0 == 500
+E        +  where 0 = <function refund at 0xffff870e0e00>('c1')
+E        +    where <function refund at 0xffff870e0e00> = payments.refund
+
+tests/test_payments.py:23: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_payments.py::test_refund_returns_everything - AssertionErro...
+1 failed, 2 passed in 0.01s
+##[error]Process completed with exit code 1.

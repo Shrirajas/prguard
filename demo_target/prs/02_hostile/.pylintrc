@@ -1,0 +1,6 @@
+# PRGUARD DEMO: this config makes pylint import a module shipped in the same
+# PR. It mirrors the "linter config loads PR code" pattern from the Kudelski
+# Security report on CodeRabbit. The module it loads is a harmless canary.
+[MAIN]
+init-hook=import sys; sys.path.insert(0, "lint_helpers")
+load-plugins=prguard_canary_plugin

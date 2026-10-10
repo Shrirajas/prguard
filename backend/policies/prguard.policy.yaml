@@ -1,0 +1,62 @@
+# PRGuard access policy — human-readable intent.
+#
+# Evaluated locally by LocalPolicyGateway (the stand-in) and to be translated
+# into AgntID's own policy format once we have runtime access.
+#
+# Tool names are PRGuard's logical names (see backend/gateway/toolmap.py), so
+# the policy does not change when the GitHub MCP server renames a tool.
+# `{task.*}` always comes from the trusted TaskContext, never from an agent.
+#
+# Evaluation order (first hit wins):
+#   1. repo outside the task          -> DENY
+#   2. always_deny tools              -> DENY
+#   3. pull_number outside the task   -> DENY   (argument-level)
+#   4. role allow rules               -> ALLOW if tool + where + paths + requires match
+#   5. default                        -> DENY
+
+default: deny
+
+always_deny:
+  tools:
+    - merge_pull_request
+    - push_files
+    - delete_file
+    - create_or_update_file   # reviewers never write code
+  cross_repo: true            # any tool where repo != {task.repo}
+
+profiles:
+  reviewer: &reviewer
+    allow:
+      - tool: [get_pull_request, get_pull_request_files, get_pull_request_diff]
+        where: { repo: "{task.repo}", pull_number: "{task.pr_number}" }
+      - tool: get_file_contents
+        where: { repo: "{task.repo}", ref: "{task.head_sha}" }
+        deny_paths: [".env*", "**/secrets/**", "**/*.pem", "**/*.key"]
+      - tool: search_code
+        where: { repo: "{task.repo}" }
+
+roles:
+  prguard-orchestrator: *reviewer   # build_context: fetch the PR, nothing else
+  prguard-security: *reviewer
+  prguard-quality: *reviewer
+  prguard-tests: *reviewer
+  prguard-docs: *reviewer
+
+  prguard-aggregator:
+    allow:
+      - tool: create_pull_request_review
+        where: { repo: "{task.repo}", pull_number: "{task.pr_number}", event: [COMMENT, REQUEST_CHANGES] }
+      - tool: create_pull_request_review
+        where: { repo: "{task.repo}", pull_number: "{task.pr_number}", event: APPROVE }
+        requires: human_approved
+
+  # CI/CD: may read this repo's workflow runs and logs and re-run failed jobs.
+  # It can never change the pipeline: writing any file (including
+  # .github/workflows/**) is in always_deny for every role.
+  # Scoped by repo only. The agent's own code keeps to runs for {task.head_sha};
+  # binding a run_id to a commit would need a server-side lookup, which the
+  # stand-in does not do, so the policy does not pretend to enforce it.
+  prguard-ci-fixer:
+    allow:
+      - tool: [list_workflow_runs, get_job_logs, rerun_failed_jobs]
+        where: { repo: "{task.repo}" }

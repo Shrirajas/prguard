@@ -1,0 +1,10 @@
+# Only needed with UPSTREAM=mcp. The backend, canary listener and UI run on the host.
+services:
+  github-mcp-server:
+    image: ghcr.io/github/github-mcp-server
+    command: ["http", "--port", "8081"]   # check `--help` for your server version's HTTP flags
+    environment:
+      # UNSAFE path only: fine-grained PAT limited to the two throwaway repos.
+      GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_PAT_UNSAFE:?set GITHUB_PAT_UNSAFE in .env}
+    ports:
+      - "127.0.0.1:8081:8081"
