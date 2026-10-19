@@ -6,13 +6,14 @@ import httpx
 import pytest
 
 from backend import commands, triggers
+from backend import context as ctxmod
 from backend.agents import aggregator, describer, llm
 from backend.cli import main as cli_main
 from backend.config import settings
 from backend.context import Options, load_config
 from backend.events import bus
 from backend.gateway import gateway, mock_upstream
-from backend.models import TaskContext
+from backend.models import TaskContext, UpstreamError
 
 
 async def ctx_for(pr: int) -> TaskContext:
@@ -65,6 +66,12 @@ async def test_describe_keeps_the_authors_text_and_replaces_its_own_section():
     second = up.bodies[1]
     assert second.count(describer.START) == 1 and "Author added this later." in second and second.startswith(original)
 
+    # The author edits while the model is still writing: the edit must survive the PATCH.
+    context = await ctxmod.build(ctx, await load_config(ctx, gateway()), gateway(), Options(), want_head_files=False)
+    up.bodies[1] = original + "\n\nTypo fixed mid-run."
+    await describer.run(ctx, context, Options(), gateway())
+    assert "Typo fixed mid-run." in up.bodies[1] and up.bodies[1].count(describer.START) == 1
+
 
 async def test_improve_posts_inline_suggestions_on_this_commit():
     up = mock_upstream()
@@ -77,6 +84,21 @@ async def test_improve_posts_inline_suggestions_on_this_commit():
     assert comment["path"] == "app/payments.py" and comment["side"] == "RIGHT" and "```suggestion" in comment["body"]
     assert "amount_cents <= 0" in comment["body"]
     assert any("prguard:improve" in c["body"] for c in up.comments)
+
+
+async def test_improve_summary_survives_a_refused_inline_review(monkeypatch):
+    up = mock_upstream()
+    real = up.call
+
+    async def call(tool, args):
+        if tool == "create_pull_request_review":
+            raise UpstreamError("GitHub 422: Unprocessable Entity")
+        return await real(tool, args)
+
+    monkeypatch.setattr(up, "call", call)
+    result = await commands.run(await ctx_for(1), "improve", Options())
+    assert "422" in result.usage["publish_error"] and not up.reviews
+    assert any("prguard:improve" in c["body"] for c in up.comments)  # the summary still posts
 
 
 async def test_ask_answers_in_a_new_comment():
@@ -276,3 +298,62 @@ async def test_model_down_is_reported_not_passed_as_clean(fake_model):
     assert not result.ok and "all reviewers failed" in result.error
     assert result.gate["failed"] is False and result.gate["error"]   # fail_on_error defaults to false
     assert any(e.type == "error" for e in bus.history)
+
+
+async def test_human_approve_is_pinned_to_the_reviewed_commit():
+    from fastapi import HTTPException
+
+    from backend import main
+
+    up = mock_upstream()
+    ctx = await ctx_for(2)
+    result = await commands.run(ctx, "review", Options(publish=False))
+    assert result.review.verdict == "NEEDS_HUMAN"
+    # The author pushed after the review: the stored head is no longer the PR's head.
+    stale = ctx.model_copy(update={"review_id": "stale", "head_sha": "a" * 40})
+    main.contexts["stale"], main.results["stale"] = stale, result
+    with pytest.raises(HTTPException) as refused:
+        await main.approve("stale")
+    assert refused.value.status_code == 409 and not up.reviews and not stale.human_approved
+
+    main.contexts[ctx.review_id], main.results[ctx.review_id] = ctx, result
+    assert (await main.approve(ctx.review_id))["posted"] is True
+    assert [(r["event"], r["commit_id"]) for r in up.reviews] == [("APPROVE", ctx.head_sha)]
+    with pytest.raises(HTTPException) as twice:   # a second click must not post a second APPROVE
+        await main.approve(ctx.review_id)
+    assert twice.value.status_code == 409 and len(up.reviews) == 1
+
+
+async def test_config_read_error_fails_closed_but_missing_config_means_defaults():
+    from backend.models import UpstreamError
+
+    class Failing:
+        def __init__(self, message):
+            self.message = message
+
+        async def call(self, *_):
+            raise UpstreamError(self.message)
+
+    ctx = await ctx_for(1)
+    assert (await load_config(ctx, Failing("GitHub 404: Not Found"))).source == "defaults"
+    with pytest.raises(UpstreamError):   # a 502 must not silently swap the repo's gate for the defaults
+        await load_config(ctx, Failing("GitHub 502"))
+
+
+async def test_failed_webhook_can_be_redelivered(monkeypatch):
+    import hashlib
+    import hmac
+
+    from backend import main
+
+    monkeypatch.setattr(settings, "github_webhook_secret", "s3cret")
+    monkeypatch.setattr(settings, "allowed_repos", settings.target_repo)
+    body = json.dumps({"action": "created", "repository": {"full_name": settings.target_repo},
+                       "issue": {"number": 99, "pull_request": {}},   # PR #99 does not exist: the lookup fails
+                       "comment": {"body": "/review", "user": {"login": "dev"}, "author_association": "OWNER"}}).encode()
+    headers = {"X-GitHub-Event": "issue_comment", "X-GitHub-Delivery": "delivery-1",
+               "X-Hub-Signature-256": "sha256=" + hmac.new(b"s3cret", body, hashlib.sha256).hexdigest()}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://t") as client:
+        first = await client.post("/webhook", content=body, headers=headers)
+        again = await client.post("/webhook", content=body, headers=headers)
+    assert first.status_code == 502 and again.status_code == 502   # not {"status": "duplicate"}

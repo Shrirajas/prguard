@@ -6,6 +6,7 @@
   prguard ask      --repo owner/name --pr 123 "is this backwards compatible?"
   prguard run      --event-path $GITHUB_EVENT_PATH   # GitHub Actions: PR events and /commands
   prguard serve                                       # webhook server + dashboard
+  prguard files    --local .                          # the changed files and their size in model tokens (JSON)
   prguard doctor                                      # check model server, GitHub token, sandbox
   prguard eval                                        # score the configured models on labelled PRs
 
@@ -46,6 +47,13 @@ def _target(p: argparse.ArgumentParser) -> None:
     p.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", ""), help="owner/name (default: $GITHUB_REPOSITORY)")
     p.add_argument("--pr", type=int, help="pull request number")
     p.add_argument("--pr-url", help="https://github.com/owner/name/pull/123")
+    p.add_argument("--local", type=Path, help="review this git working tree against its base branch (no PR, posts nothing)")
+    p.add_argument("--base", default="", help="with --local: branch or commit to diff against (default: origin/HEAD, main, ...)")
+    p.add_argument("--file", action="append", default=[], metavar="PATH",
+                   help="with --local: review only this changed file (repeat for more; default: every changed file)")
+    p.add_argument("--since", default="", metavar="TREE",
+                   help="with --local: review only what changed after this snapshot (the usage.local_tree of an earlier "
+                        "review) or commit; HEAD = uncommitted changes only")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -65,6 +73,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("serve", help="webhook server and dashboard")
     p.add_argument("--host", default=os.environ.get("PRGUARD_HOST", "0.0.0.0"))
     p.add_argument("--port", type=int, default=int(os.environ.get("PRGUARD_PORT", "8000")))
+    p = sub.add_parser("files", help="with --local: list the changed files, their size in model tokens and what is skipped, as JSON")
+    _target(p)
     sub.add_parser("doctor", help="check the model server, GitHub token and sandbox")
     p = sub.add_parser("eval", help="score the configured models on the labelled demo PRs")
     p.add_argument("--out", type=Path, default=Path("prguard-out"))
@@ -76,6 +86,14 @@ def _setup(args: argparse.Namespace) -> None:
     if getattr(args, "mock", False):
         settings.upstream = "mock"
         settings.llm_provider = "mock"
+    if (getattr(args, "base", "") or getattr(args, "file", []) or getattr(args, "since", "")) and not getattr(args, "local", None):
+        raise UsageError("--base, --file and --since need --local")
+    if getattr(args, "local", None):
+        # Not --repo: it defaults to $GITHUB_REPOSITORY, which Codespaces and Actions always set.
+        if getattr(args, "mock", False) or args.pr or args.pr_url:
+            raise UsageError("--local cannot be combined with --mock, --pr or --pr-url")
+        settings.upstream, settings.local_dir, settings.local_base = "local", str(args.local), args.base
+        settings.local_files, settings.local_since = args.file, args.since
     from backend.gateway import reset_gateways
 
     reset_gateways()
@@ -87,8 +105,8 @@ def _options(args: argparse.Namespace, question: str = ""):
     for path in (args.checks_file, args.ci_log):
         if path and not path.is_file():
             raise UsageError(f"{path} does not exist")
-    return Options(publish=not args.no_publish, sandbox=args.sandbox, checks_file=args.checks_file,
-                   ci_log=args.ci_log, workdir=args.workdir, question=question)
+    return Options(publish=not (args.no_publish or getattr(args, "local", None)), sandbox=args.sandbox,
+                   checks_file=args.checks_file, ci_log=args.ci_log, workdir=args.workdir, question=question)
 
 
 def _annotate(result: CommandResult, threshold: str) -> None:
@@ -146,7 +164,11 @@ async def _direct(args: argparse.Namespace) -> list[CommandResult]:
     from backend.context import load_config
     from backend.gateway import gateway
 
-    if args.pr_url:
+    if args.local:
+        from backend.gateway import local_upstream
+
+        repo, number = local_upstream().repo, 0
+    elif args.pr_url:
         parsed = triggers.parse_pr_url(args.pr_url)
         if not parsed:
             raise UsageError("--pr-url must look like https://github.com/owner/name/pull/123")
@@ -157,15 +179,40 @@ async def _direct(args: argparse.Namespace) -> list[CommandResult]:
         repo = repo or settings.target_repo
         if repo != settings.target_repo:
             settings.target_repo = repo
-    if not repo or not number:
-        raise UsageError("give --repo and --pr, or --pr-url")
-    if not args.mock and not settings.github_token:
+    if not args.local and (not repo or not number):
+        raise UsageError("give --repo and --pr, or --pr-url, or --local DIR")
+    if not (args.mock or args.local) and not settings.github_token:
         raise UsageError("GITHUB_TOKEN is not set")
     gw = gateway()
     ctx = await triggers.context_for_pr(gw, repo, number)
     cfg = await load_config(ctx, gw)
     question = " ".join(getattr(args, "question", []) or [])
-    return await _run_commands(ctx, [args.cmd], _options(args, question), cfg, args.fail_on)
+    results = await _run_commands(ctx, [args.cmd], _options(args, question), cfg, args.fail_on)
+    if args.local:
+        for r in results:
+            r.usage["local_base"] = local_upstream().compared_to  # what "auto" resolved to, so the UI can say "vs main"
+            r.usage["local_tree"] = local_upstream().tree        # pass as --since next time to review only newer changes
+    return results
+
+
+async def _files(args: argparse.Namespace) -> dict:
+    """What a --local review would read: every changed file, its prompt cost, and why a file would be skipped."""
+    from backend import diffs, triggers
+    from backend.context import load_config, prompt_budget
+    from backend.gateway import gateway, local_upstream
+    from backend.gateway.policy_engine import path_denied
+
+    if not args.local:
+        raise UsageError("files needs --local DIR")
+    upstream, gw = local_upstream(), gateway()
+    cfg = await load_config(await triggers.context_for_pr(gw, upstream.repo, 0), gw)
+    files = []
+    for f in upstream.files:
+        skip = ("ignored" if path_denied(f["filename"], cfg.ignore) else "deleted" if f.get("status") == "removed"
+                else "no diff" if not f.get("patch") else "")
+        files.append({"file": f["filename"], "status": f.get("status", "modified"), "skip": skip,
+                      "tokens": 0 if skip else diffs.est_tokens(diffs.render_file(f["filename"], f["patch"], f.get("status", "modified")))})
+    return {"base": upstream.compared_to, "budget": prompt_budget(), "files": files, "tree": upstream.tree}
 
 
 async def _event(args: argparse.Namespace) -> list[CommandResult]:
@@ -212,8 +259,11 @@ def main(argv: list[str] | None = None) -> int:
         from backend.evaluation import evaluate
 
         return asyncio.run(evaluate(args.out, args.runs))
-    _setup(args)
     try:
+        _setup(args)
+        if args.cmd == "files":
+            print(json.dumps(asyncio.run(_files(args))))
+            return 0
         results = asyncio.run(_event(args) if args.cmd == "run" else _direct(args))
     except UsageError as exc:
         print(f"prguard: {exc}", file=sys.stderr)

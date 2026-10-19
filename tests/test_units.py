@@ -1,5 +1,7 @@
 """Pure pieces: diff rendering and budgets, suggestion validation, repo config, the gate, merging."""
 
+import itertools
+
 from backend import diffs, repo_config, reports
 from backend.agents import aggregator, improver
 from backend.events import redact
@@ -29,9 +31,11 @@ def test_prompt_budget_skips_generated_files_and_lists_what_did_not_fit():
     files = [{"filename": "package-lock.json", "status": "modified", "patch": PATCH * 50},
              {"filename": "app/big.py", "status": "modified", "patch": PATCH * 200, "additions": 1000},
              {"filename": "app/small.py", "status": "modified", "patch": PATCH, "additions": 5},
-             {"filename": "README.md", "status": "modified", "patch": PATCH, "additions": 5}]
+             {"filename": "README.md", "status": "modified", "patch": PATCH, "additions": 5},
+             {"filename": "app/huge.py", "status": "modified", "patch": "", "additions": 90000}]
     out = diffs.build_prompt_diff(files, repo_config.DEFAULT_IGNORE, budget_tokens=600)
     assert out.ignored == ["package-lock.json"]
+    assert out.no_patch == ["app/huge.py"] and "NOT reviewed" in out.note()   # GitHub omits patches of huge diffs
     assert "app/big.py" in out.included and "app/big.py" in out.clipped   # most-changed source first, clipped
     assert "README.md" in out.omitted and "left out" in out.note()
     assert diffs.est_tokens(out.text) <= 700
@@ -87,6 +91,7 @@ paths = ["generated/**"]
     assert any("bogus" in w for w in cfg.warnings) and any("nonsense" in w for w in cfg.warnings)
     broken = repo_config.parse("[gate\nfail_on=")
     assert broken.source == "defaults" and broken.warnings
+    assert broken.gate.fail_on_error is True  # unreadable config fails closed on a model outage
 
 
 def f(severity, confidence=0.9, status="CONFIRMED", category="bug", agent="quality"):
@@ -124,6 +129,8 @@ def test_merge_groups_by_topic_not_by_category_name():
     ]
     assert aggregator.score(merged)[1] == "NEEDS_HUMAN"   # an injection attempt always goes to a human
     assert aggregator.score(merged[1:])[1] == "REQUEST_CHANGES"
+    # Llama 3.1 names the .pylintrc problem "config-injection"; it is code execution, not prompt injection.
+    assert aggregator.topic(g("security", "CRITICAL", "config-injection", "Config injection in pylint", 1, 1)) == "code-execution"
 
 
 def test_redaction():
@@ -181,3 +188,119 @@ async def test_github_client_request_shapes(monkeypatch):
     for tool in ("merge_pull_request", "push_files", "create_or_update_file", "delete_file", "update_pull_request"):
         with _pytest.raises(UpstreamError):
             await client.call(tool, {"repo": "o/r", "pull_number": 5})
+
+
+async def test_checkout_keeps_the_token_off_the_command_line(monkeypatch):
+    import asyncio
+
+    from backend.sandbox import checkout
+
+    seen = {}
+
+    class Done:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", b""
+
+    async def fake_exec(*argv, env=None, **_):
+        seen["argv"], seen["env"] = argv, env
+        return Done()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    await checkout._git("fetch", "url", header="AUTHORIZATION: basic c2VjcmV0")
+    assert not any("c2VjcmV0" in a for a in seen["argv"])   # `ps` shows argv to every user
+    assert seen["env"]["GIT_CONFIG_VALUE_0"] == "AUTHORIZATION: basic c2VjcmV0"
+
+
+async def test_github_post_is_not_retried_after_a_gateway_error(monkeypatch):
+    import httpx
+    import pytest as _pytest
+
+    from backend.gateway import github as gh
+    from backend.models import UpstreamError
+
+    posts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posts.append(request.method)
+        return httpx.Response(502)   # GitHub may still have created the comment
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(gh.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    with _pytest.raises(UpstreamError):
+        await gh.GitHubUpstream(token="t", api_url="https://api.example").call(
+            "create_issue_comment", {"repo": "o/r", "pull_number": 5, "body": "answer"})
+    assert posts == ["POST"]   # once: a retry could post the answer twice
+
+
+def test_batches_cover_every_line_within_budget():
+    new_file = "@@ -0,0 +1,400 @@\n" + "".join(f"+line number {n} of a big new file\n" for n in range(1, 401))
+    files = [{"filename": "b/big.py", "status": "added", "patch": new_file},
+             {"filename": "a/small.py", "status": "modified", "patch": PATCH},
+             {"filename": "x/package-lock.json", "status": "modified", "patch": PATCH},
+             {"filename": "gone.py", "status": "removed", "patch": ""},
+             {"filename": "z/huge.py", "status": "modified", "patch": ""}]
+    batches, summary = diffs.build_batches(files, repo_config.DEFAULT_IGNORE, budget_tokens=600)
+    assert all(diffs.est_tokens(b.text) <= 600 for b in batches) and not summary.clipped
+    assert summary.ignored == ["x/package-lock.json"] and summary.no_patch == ["z/huge.py"]
+    assert batches[0].spans[0] == ("a/small.py", 18, 25)                       # path order
+    big = [(lo, hi) for b in batches for name, lo, hi in b.spans if name == "b/big.py"]
+    assert len(big) > 3 and big[0][0] == 1 and big[-1][1] == 400               # one new-file hunk, split by lines
+    assert all(prev[1] + 1 == nxt[0] for prev, nxt in itertools.pairwise(big))     # no line lost or repeated
+    assert "gone.py" in batches[-1].text
+    assert diffs.batch_of("b/big.py", 400, batches) == len(batches) - 1 and diffs.batch_of("nope.py", 1, batches) == 0
+    one_line = [{"filename": "m.js", "status": "added", "patch": "@@ -0,0 +1 @@\n+" + "x" * 9000 + "\n"}]
+    assert diffs.build_batches(one_line, [], 600)[1].clipped == ["m.js"]       # minified: one line bigger than a prompt
+
+
+async def test_reviewer_reads_every_batch_and_survives_one_failure(monkeypatch):
+    from backend.agents import llm, specialists
+    from backend.config import settings
+    from backend.models import TaskContext
+
+    for key, value in (("llm_provider", "local"), ("llm_base_url", "http://x"), ("llm_model", "m")):
+        monkeypatch.setattr(settings, key, value)
+    calls = []
+
+    async def chat(system, user, **kw):
+        calls.append(user)
+        if "fail.py" in user:
+            raise llm.LLMError("boom")
+        file = "a.py" if "a.py" in user else "b.py"
+        return llm.ChatResult(text=f'{{"findings": [{{"severity": "HIGH", "category": "bug", "summary": "bad", '
+                                   f'"file_path": "{file}", "line_start": 1}}]}}', prompt_tokens=10, calls=1)
+
+    monkeypatch.setattr(specialists.llm, "chat", chat)
+    batches = [diffs.Batch(f"## File: {name}", [(name, 1, 1)]) for name in ("a.py", "fail.py", "b.py")]
+    ctx = TaskContext(review_id="r", repo_full_name="o/r", pr_number=0, head_sha="h")
+    context = {"config": repo_config.defaults(), "batches": batches, "check_results": {}}
+    findings, usage = await specialists.run_specialist("quality", ctx, context, None)
+    assert len(calls) == 3 and [f.file_path for f in findings] == ["a.py", "b.py"]
+    assert usage["prompt_tokens"] == 20 and "1 of 3 prompts failed" in usage["unreviewed"]
+    context["batches"] = batches[1:2]
+    try:
+        await specialists.run_specialist("quality", ctx, context, None)
+        raise AssertionError("every prompt failed, so the reviewer must fail")
+    except llm.LLMError:
+        pass
+
+
+async def test_checker_checks_each_finding_against_its_own_batch(monkeypatch):
+    from backend.agents import checker, llm
+
+    monkeypatch.setattr(checker.llm, "checker_endpoint", lambda: llm.Endpoint("http://x", "", "gemma-checker"))
+    seen = []
+
+    async def chat(system, user, **kw):
+        seen.append(user)
+        return llm.ChatResult(text='{"verdicts": [{"index": 0, "status": "REJECTED"}]}' if "b.py" in user
+                              else '{"verdicts": [{"index": 0, "status": "CONFIRMED", "reason": "ok"}]}')
+
+    monkeypatch.setattr(checker.llm, "chat", chat)
+    batches = [diffs.Batch("## File: a.py\nAAA", [("a.py", 1, 50)]), diffs.Batch("## File: b.py\nBBB", [("b.py", 1, 50)])]
+    finding = lambda path: Finding(agent_type="quality", severity="HIGH", category="bug", summary="s", file_path=path,
+                                   line_start=3, line_end=3, confidence=0.9)
+    kept, notes, _ = await checker.check([finding("a.py"), finding("b.py")], batches)
+    assert len(seen) == 2 and "AAA" in seen[0] and "BBB" not in seen[0] and "BBB" in seen[1]
+    assert [(f.file_path, f.checker_status) for f in kept] == [("a.py", "CONFIRMED")] and "rejected 1" in notes

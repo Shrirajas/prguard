@@ -170,11 +170,14 @@ async def run(ctx: TaskContext, context: dict[str, Any], options: ctxmod.Options
                                           "body": f"PRGuard: {len(suggestions)} code suggestion(s) for `{ctx.head_sha[:7]}`."})
                 if not isinstance(res, Denial) and isinstance(res.data, dict) and res.data.get("html_url"):
                     posted.append(res.data["html_url"])
+        except UpstreamError as exc:  # e.g. 422 on one bad line; still post the summary below
+            usage["publish_error"] = str(exc)[:300]
+        try:
             res = await gateway.call(AGENT_ID, ctx, "upsert_issue_comment",
                                      {"repo": ctx.repo_full_name, "pull_number": ctx.pr_number, "marker": "improve",
                                       "body": summary_markdown(suggestions, ctx.head_sha, len(dropped))})
             if not isinstance(res, Denial) and isinstance(res.data, dict) and res.data.get("html_url"):
                 posted.append(res.data["html_url"])
         except UpstreamError as exc:
-            usage["publish_error"] = str(exc)[:300]
+            usage.setdefault("publish_error", str(exc)[:300])
     return suggestions, posted, usage

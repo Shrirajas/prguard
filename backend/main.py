@@ -175,7 +175,8 @@ async def webhook(request: Request, background: BackgroundTasks) -> dict[str, An
     try:
         job, reason = await triggers.job_from_event(event, payload, gateway())
     except UpstreamError as exc:
-        return {"status": "error", "reason": str(exc)}
+        seen_deliveries.pop(delivery, None)  # so a redelivery from GitHub is processed, not called a duplicate
+        raise HTTPException(502, str(exc)) from exc
     if job is None:
         return {"status": "ignored", "reason": reason}
     background.add_task(_run_job, job.ctx, job.commands, job.cfg, job.question)
@@ -189,15 +190,25 @@ async def approve(review_id: str) -> dict[str, Any]:
         raise HTTPException(404, "unknown or unfinished review")
     if result.review.verdict != "NEEDS_HUMAN":
         raise HTTPException(409, "this review is not waiting for a human")
+    try:
+        current = await triggers.context_for_pr(gateway(), ctx.repo_full_name, ctx.pr_number)
+    except UpstreamError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    if current.head_sha != ctx.head_sha:
+        raise HTTPException(409, f"new commits since this review ({ctx.head_sha[:7]} -> {current.head_sha[:7]}); review again first")
+    # No await between check and set, so two quick clicks cannot both post an APPROVE.
+    if ctx.human_approved:
+        raise HTTPException(409, "already approved")
     # Runtime permission change, scoped to this one task.
     ctx.human_approved = True
     bus.emit(Event(type="hitl.approved", review_id=review_id, source="operator",
                    reason=f"human approved; APPROVE unlocked for {ctx.repo_full_name}#{ctx.pr_number} only"))
-    args = {"repo": ctx.repo_full_name, "pull_number": ctx.pr_number, "event": "APPROVE",
+    args = {"repo": ctx.repo_full_name, "pull_number": ctx.pr_number, "event": "APPROVE", "commit_id": ctx.head_sha,
             "body": "Approved by a human reviewer via PRGuard."}
     try:
         res = await gateway().call(aggregator.AGENT_ID, ctx, "create_pull_request_review", args)
     except UpstreamError as exc:
+        ctx.human_approved = False  # nothing was posted; let the operator try again
         return {"approved": True, "posted": False, "reason": f"allowed by policy, refused by GitHub: {exc}"}
     if isinstance(res, Denial):
         return {"approved": True, "posted": False, "reason": res.reason}
@@ -223,9 +234,9 @@ async def show_config(owner: str, name: str, pr: int) -> dict[str, Any]:
         raise HTTPException(403, f"{repo} is not in PRGUARD_ALLOWED_REPOS")
     try:
         ctx = await triggers.context_for_pr(gateway(), repo, pr)
+        cfg = await load_config(ctx, gateway())
     except UpstreamError as exc:
         raise HTTPException(502, str(exc)) from exc
-    cfg = await load_config(ctx, gateway())
     from dataclasses import asdict
 
     return asdict(cfg)

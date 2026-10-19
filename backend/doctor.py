@@ -29,6 +29,9 @@ async def _model(label: str, endpoint: llm.Endpoint | None) -> bool:
     except llm.LLMError as exc:
         print(f"  {label:9} ✗ {endpoint.model} at {endpoint.base_url}: {exc}")
         return False
+    if not result.text:
+        print(f"  {label:9} ✗ {endpoint.model} at {endpoint.base_url} answered with empty text (thinking model out of tokens?)")
+        return False
     print(f"  {label:9} ✓ {endpoint.model} at {endpoint.base_url} answered in {time.monotonic() - started:.1f}s"
           f" ({result.text[:40]!r}){note}{' · ' + '; '.join(result.notes) if result.notes else ''}")
     return True

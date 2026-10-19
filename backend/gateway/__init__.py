@@ -6,6 +6,7 @@ from functools import lru_cache
 
 from backend.config import settings
 from backend.gateway.base import ToolGateway, Upstream
+from backend.gateway.local_upstream import LocalUpstream
 from backend.gateway.mock_upstream import MockUpstream
 from backend.gateway.policy_gateway import PolicyGateway
 
@@ -16,9 +17,16 @@ def mock_upstream() -> MockUpstream:
 
 
 @lru_cache
+def local_upstream() -> LocalUpstream:
+    return LocalUpstream(settings.local_dir, settings.local_base, settings.local_files, settings.local_since)
+
+
+@lru_cache
 def _upstream() -> Upstream:
     if settings.upstream == "mock":
         return mock_upstream()
+    if settings.upstream == "local":
+        return local_upstream()
     from backend.gateway.github import GitHubUpstream
 
     return GitHubUpstream()
@@ -35,5 +43,5 @@ def gateway() -> ToolGateway:
 
 def reset_gateways() -> None:
     """Forget cached gateways (tests, or after settings change)."""
-    for cached in (mock_upstream, _upstream, _gateway):
+    for cached in (mock_upstream, local_upstream, _upstream, _gateway):
         cached.cache_clear()

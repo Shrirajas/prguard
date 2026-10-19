@@ -6,6 +6,9 @@
 # - Pull request opened / pushed: [auto] commands from .prguard.toml
 #   (default: describe + review on open, review on push). The job FAILS when the
 #   review gate fails, so make "PRGuard" a required check in branch protection.
+#   A PR can edit this file and the edited copy is what runs, so also put
+#   .github/workflows/ under CODEOWNERS with "Require review from Code Owners".
+#   Self-hosted runner: require approval for fork PR workflows, or forks run code on it.
 # - PR comment "/review", "/describe", "/improve", "/ask <question>" from a
 #   member/collaborator runs that command.
 name: PRGuard

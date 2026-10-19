@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import sys
 from collections import deque
 from typing import Any
 
@@ -50,6 +51,9 @@ class EventBus:
 
     def emit(self, event: Event) -> Event:
         self.history.append(event)
+        if settings.progress and event.type.startswith("span.") and event.payload.get("node"):
+            count = f" {event.payload['done']}/{event.payload['total']}" if event.type == "span.progress" else ""
+            print(f"prguard-progress {event.type} {event.payload['node']}{count}", file=sys.stderr, flush=True)
         if event.review_id:
             settings.runs_dir.mkdir(exist_ok=True)
             with open(settings.runs_dir / f"{event.review_id}.jsonl", "a", encoding="utf-8") as f:

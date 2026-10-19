@@ -7,6 +7,7 @@ All GitHub reads go through the policy gateway under trusted roles
 from __future__ import annotations
 
 import asyncio
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -52,8 +53,10 @@ async def load_config(ctx: TaskContext, gateway: ToolGateway) -> RepoConfig:
     try:
         res = await gateway.call(CONFIG_AGENT, ctx, "get_file_contents",
                                  {"repo": ctx.repo_full_name, "path": ".prguard.toml", "ref": ctx.base_ref})
-    except UpstreamError:
-        return repo_config.defaults()
+    except UpstreamError as exc:
+        if "404" in str(exc):  # no .prguard.toml on the base branch
+            return repo_config.defaults()
+        raise  # fail closed: defaults could silently weaken the repo's gate
     if isinstance(res, Denial):
         cfg = repo_config.defaults()
         cfg.warnings.append(f"could not read .prguard.toml: {res.reason}")
@@ -85,6 +88,9 @@ async def build(ctx: TaskContext, cfg: RepoConfig, gateway: ToolGateway, options
 
     prompt_diff = diffs.build_prompt_diff(files, cfg.ignore, prompt_budget())
     small = diffs.build_prompt_diff(files, cfg.ignore, prompt_budget(overhead=3200))
+    # /review reads the whole change in as many prompts as it takes; the other commands use the single prompt above.
+    batches, reviewed = diffs.build_batches(files, cfg.ignore, prompt_budget())
+    batch_note = f"reviewed in {len(batches)} prompts of up to {prompt_budget()} tokens" if len(batches) > 1 else ""
 
     head_files: dict[str, str] = {}
     if want_head_files:
@@ -106,7 +112,8 @@ async def build(ctx: TaskContext, cfg: RepoConfig, gateway: ToolGateway, options
     return {
         "config": cfg, "pr": pr, "title": pr.get("title", ""), "body": pr.get("body", ""),
         "files": files, "diff": diff, "prompt_diff": prompt_diff.text, "prompt_diff_small": small.text,
-        "diff_note": prompt_diff.note(), "head_files": head_files, "check_results": check_results,
+        "batches": batches, "diff_note": "; ".join(n for n in (batch_note, reviewed.note()) if n),
+        "head_files": head_files, "check_results": check_results,
         "ci_log": options.ci_log.read_text(encoding="utf-8", errors="replace") if options.ci_log else "",
     }
 
@@ -118,7 +125,10 @@ async def _checks(ctx: TaskContext, cfg: RepoConfig, options: Options) -> dict[s
         return runner.skipped("sandbox disabled; no pipeline check output given")
     try:
         src = await asyncio.wait_for(checkout_pr(ctx, options.workdir), timeout=180)
-        return await runner.run_checks(src, ctx, cfg.checks)
+        try:
+            return await runner.run_checks(src, ctx, cfg.checks)
+        finally:
+            shutil.rmtree(src, ignore_errors=True)  # a full copy of the PR per review would fill the disk
     except Exception as exc:  # a failed checkout must not sink the review
         bus.emit(Event(type="error", review_id=ctx.review_id, source="sandbox", reason=str(exc)[:300]))
         return runner.skipped(f"checkout failed: {exc}")

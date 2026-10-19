@@ -13,8 +13,9 @@ from typing import Any
 
 from backend.agents import llm, prompts
 from backend.config import settings
+from backend.events import bus
 from backend.gateway.base import ToolGateway
-from backend.models import Denial, Finding, TaskContext, UpstreamError
+from backend.models import Denial, Event, Finding, TaskContext, UpstreamError
 
 ROLES = ["security", "quality", "tests", "docs"]
 MAX_TOOL_TURNS = 3
@@ -157,13 +158,40 @@ async def run_specialist(role: str, ctx: TaskContext, context: dict[str, Any], g
         return await _tool(role, ctx, gateway, name, args)
 
     cfg = context["config"]
-    result = await llm.chat(
-        prompts.specialist_system(role, ctx.repo_full_name, ctx.pr_number, ctx.head_sha,
-                                  max_findings=cfg.review.max_findings, extra_instructions=cfg.review.extra_instructions),
-        prompts.pr_block(context["prompt_diff"], context["check_results"], title=context.get("title", "")),
-        tools=TOOLS, on_tool=on_tool, max_tool_turns=MAX_TOOL_TURNS,
-    )
-    return parse_findings(result.text, role)[: cfg.review.max_findings], result.usage()
+    system = prompts.specialist_system(role, ctx.repo_full_name, ctx.pr_number, ctx.head_sha,
+                                       max_findings=cfg.review.max_findings, extra_instructions=cfg.review.extra_instructions)
+    # One prompt per batch, so a big change is read in full. Contexts built before batching have only prompt_diff.
+    texts = [b.text for b in context["batches"]] if "batches" in context else [context["prompt_diff"]]
+    findings: list[Finding] = []
+    usage: dict[str, Any] = {}
+    failed: list[str] = []
+
+    def progress(done: int) -> None:
+        bus.emit(Event(type="span.progress", review_id=ctx.review_id, source=agent_id(role),
+                       payload={"node": role, "done": done, "total": len(texts)}))
+
+    progress(0)
+    for done, text in enumerate(texts, start=1):
+        try:
+            result = await llm.chat(system, prompts.pr_block(text, context["check_results"], title=context.get("title", "")),
+                                    tools=TOOLS, on_tool=on_tool, max_tool_turns=MAX_TOOL_TURNS)
+        except llm.LLMError as exc:
+            failed.append(str(exc)[:150])  # one bad prompt must not throw away the other batches' findings
+            if len(failed) == len(texts):
+                raise
+        else:
+            findings += parse_findings(result.text, role)[: cfg.review.max_findings]
+            for key, value in result.usage().items():
+                if isinstance(value, (int, float)):
+                    usage[key] = round(usage.get(key, 0) + value, 2)
+                elif isinstance(value, list):
+                    usage[key] = usage.get(key, []) + value
+                else:
+                    usage.setdefault(key, value)
+        progress(done)
+    if failed:
+        usage["unreviewed"] = f"{len(failed)} of {len(texts)} prompts failed, so part of the change is unreviewed: {failed[0]}"
+    return findings, usage
 
 
 # ---------------------------------------------------------------- mock LLM

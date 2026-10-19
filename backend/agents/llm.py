@@ -172,7 +172,9 @@ async def chat(system: str, user: str, *, endpoint: Endpoint | None = None,
     use_json = settings.llm_json_mode if json_mode is None else json_mode
     use_tools = bool(tools and on_tool and settings.llm_tools)
     base: dict[str, Any] = {"model": endpoint.model, "temperature": temperature,
-                            "max_tokens": max_tokens or settings.llm_max_output_tokens}
+                            "max_tokens": max_tokens or settings.llm_max_output_tokens,
+                            # Thinking models (Gemma 4, Qwen 3) otherwise spend max_tokens on hidden reasoning and answer ''.
+                            "chat_template_kwargs": {"enable_thinking": False}}
     messages: list[dict[str, Any]] = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     wire_tools = [{"type": "function", "function": {"name": t["name"], "description": t["description"],
                                                      "parameters": t["input_schema"]}} for t in tools or []]

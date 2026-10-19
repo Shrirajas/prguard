@@ -86,6 +86,16 @@ llama-server -m gemma-4-12b-it-Q4_K_M.gguf --port 8101 -c 8192 -np 1 --jinja
 (`LLM_BASE_URL=http://host:11434/v1`). If the GPU is shared with other users,
 keep `LLM_CONCURRENCY` at 1–2.
 
+`/review` reads the whole change however big it is: the diff is split into prompts of about
+`LLM_CONTEXT_TOKENS` − `LLM_MAX_OUTPUT_TOKENS` − 1100 tokens, and every reviewer reads every prompt
+(a new file too big for one prompt is split by lines). A change of ~290k tokens is ~65 prompts per reviewer,
+so review time grows with the size of the change. `NODE_TIMEOUT_S` is per prompt.
+`prguard files --local DIR` lists what a local review would read and the size of each file in tokens;
+`--file PATH` (repeatable) reviews only those changed files.
+`--since TREE` reviews only what changed after an earlier review, like a PR's new commits: every local
+report has `usage.local_tree`, a snapshot of the working tree it reviewed; pass it back next time.
+`--since HEAD` reviews the uncommitted changes. The repo's `.prguard.toml` is still read at the base branch.
+
 ## 2. Build the images
 
 ```bash
@@ -131,7 +141,11 @@ Ready-made pipelines:
 - **GitHub Actions**: [`examples/github-actions/prguard.yml`](examples/github-actions/prguard.yml).
   It runs on PR open and push plus `/commands` in comments, uploads SARIF, and writes
   the job summary. Make the **PRGuard** check *required* in branch protection to
-  enforce the gate.
+  enforce the gate. **Also protect the workflow file itself:** on `pull_request` events
+  GitHub runs the workflow *from the PR*, so a PR that edits it to `run: true` passes the
+  check. Add `/.github/workflows/ @your-org/ci-owners` to `CODEOWNERS` and turn on
+  *Require review from Code Owners*. On a self-hosted runner, also require approval
+  before running workflows from forks (Settings → Actions → General).
 - **Jenkins**: [`examples/jenkins/Jenkinsfile`](examples/jenkins/Jenkinsfile).
 
 In GitHub Actions, `prguard run` reads `$GITHUB_EVENT_PATH` and picks the
@@ -196,6 +210,8 @@ npm --prefix frontend install && npm --prefix frontend run dev   # dashboard on 
 ## Limits, stated plainly
 
 - GitHub and GitHub Enterprise Server only; there are no GitLab or Bitbucket providers yet.
+- Big changes take long on a small model: every reviewer reads every prompt, one after another when
+  `LLM_CONCURRENCY` is 1. `/describe`, `/improve` and `/ask` still read only what fits in one prompt.
 - 8B models are noisy. That is why the checker exists, why the gate uses
   `min_confidence`, and why `/improve` suggestions are validated by code. Measure with `prguard eval`.
 - On PRs from forks, GitHub Actions gives a read-only token. The gate and reports still work,

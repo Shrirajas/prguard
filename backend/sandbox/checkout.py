@@ -17,11 +17,13 @@ from backend.models import TaskContext
 
 
 async def _git(*args: str, cwd: Path | None = None, header: str = "") -> None:
-    extra = ["-c", f"http.extraheader={header}"] if header else []
+    env = {"PATH": "/usr/bin:/bin:/usr/local/bin", "GIT_TERMINAL_PROMPT": "0", "HOME": "/nonexistent"}
+    if header:  # via env, not `-c`: command lines are readable by every user on the host (ps)
+        env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="http.extraheader", GIT_CONFIG_VALUE_0=header)
     proc = await asyncio.create_subprocess_exec(
-        "git", "-c", "credential.helper=", *extra, *args,
+        "git", "-c", "credential.helper=", *args,
         cwd=cwd,
-        env={"PATH": "/usr/bin:/bin:/usr/local/bin", "GIT_TERMINAL_PROMPT": "0", "HOME": "/nonexistent"},
+        env=env,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     _, err = await asyncio.wait_for(proc.communicate(), timeout=120)
@@ -34,6 +36,12 @@ async def checkout_pr(ctx: TaskContext, workdir: Path | None = None) -> Path:
     if dest.exists():
         shutil.rmtree(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
+
+    if settings.upstream == "local":  # your own working tree: git's file list only, so ignored files (.env, keys) stay out
+        from backend.gateway import local_upstream
+
+        local_upstream().materialize(dest)
+        return dest
 
     if workdir is not None:  # CI: the pipeline already checked the PR out
         shutil.copytree(workdir, dest, ignore=shutil.ignore_patterns(".git"), symlinks=True)

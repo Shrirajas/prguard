@@ -20,6 +20,7 @@ from backend import context as ctxmod
 from backend import reports
 from backend.agents import aggregator, checker, ci_fixer, specialists
 from backend.config import settings
+from backend.diffs import Batch
 from backend.events import bus
 from backend.gateway import gateway
 from backend.models import Denial, Event, Finding, Review, TaskContext, UpstreamError
@@ -31,6 +32,7 @@ class ReviewState(TypedDict, total=False):
     context: dict[str, Any]
     findings_by_agent: Annotated[dict[str, list[Finding]], operator.or_]
     agent_errors: Annotated[dict[str, str], operator.or_]
+    agent_notes: Annotated[dict[str, str], operator.or_]  # partial failures; unlike agent_errors they don't fail the run
     review: Review
     role: str  # only set on the per-specialist payload
 
@@ -62,15 +64,16 @@ def fan_out(state: ReviewState) -> list[Send]:
     return sends or [Send("aggregate", state)]
 
 
-async def _guarded(ctx: TaskContext, source: str, node: str, coro) -> tuple[list[Finding], dict[str, Any], str]:
+async def _guarded(ctx: TaskContext, source: str, node: str, coro, prompts: int = 1) -> tuple[list[Finding], dict[str, Any], str]:
     """Run one agent. Returns (findings, usage, error); an error never blocks the join."""
     _span(ctx, source, "span.start", node=node, llm=_llm_label())
     error = ""
+    timeout = settings.node_timeout_s * max(prompts, 1)  # NODE_TIMEOUT_S is per prompt
     try:
-        findings, usage = await asyncio.wait_for(coro, timeout=settings.node_timeout_s)
+        findings, usage = await asyncio.wait_for(coro, timeout=timeout)
         note = usage.pop("note", "") if isinstance(usage, dict) else ""
     except asyncio.TimeoutError:
-        findings, usage, note = [], {}, f"timed out after {settings.node_timeout_s:.0f}s"
+        findings, usage, note = [], {}, f"timed out after {timeout:.0f}s"
         error = note
     except Exception as exc:
         findings, usage, note = [], {}, f"{type(exc).__name__}: {exc}"[:300]
@@ -83,9 +86,12 @@ async def _guarded(ctx: TaskContext, source: str, node: str, coro) -> tuple[list
 
 async def specialist(state: ReviewState) -> dict[str, Any]:
     ctx, role = state["ctx"], state["role"]
-    findings, _, error = await _guarded(ctx, specialists.agent_id(role), role,
-                                        specialists.run_specialist(role, ctx, state["context"], gateway()))
-    return {"findings_by_agent": {role: findings}, "agent_errors": {role: error} if error else {}}
+    findings, usage, error = await _guarded(ctx, specialists.agent_id(role), role,
+                                            specialists.run_specialist(role, ctx, state["context"], gateway()),
+                                            prompts=len(state["context"].get("batches", [])))
+    unreviewed = usage.pop("unreviewed", "")
+    return {"findings_by_agent": {role: findings}, "agent_errors": {role: error} if error else {},
+            "agent_notes": {role: unreviewed} if unreviewed else {}}
 
 
 async def ci_fixer_node(state: ReviewState) -> dict[str, Any]:
@@ -102,6 +108,7 @@ async def aggregate(state: ReviewState) -> dict[str, Any]:
     notes = [n for n in [state["context"].get("diff_note", "")] + state["context"]["config"].warnings if n]
     errors = state.get("agent_errors") or {}
     notes += [f"{agent} reviewer failed: {err}" for agent, err in sorted(errors.items())]
+    notes += [f"{agent} reviewer: {note}" for agent, note in sorted((state.get("agent_notes") or {}).items())]
     checks = state["context"]["check_results"]
     if checks.get("ran"):
         notes.append(f"checks: {checks.get('source')} exit codes {checks.get('exit_codes')}")
@@ -115,8 +122,9 @@ async def check(state: ReviewState) -> dict[str, Any]:
     _span(ctx, checker.AGENT_ID, "span.start", node="check")
     usage: dict[str, Any] = {}
     try:
-        findings, notes, usage = await asyncio.wait_for(
-            checker.check(review.findings, state["context"]["prompt_diff"]), timeout=settings.node_timeout_s)
+        batches = state["context"].get("batches") or [Batch(state["context"].get("prompt_diff", ""), [])]
+        findings, notes, usage = await asyncio.wait_for(checker.check(review.findings, batches),
+                                                        timeout=settings.node_timeout_s * max(len(batches), 1))
     except asyncio.TimeoutError:
         findings, notes = review.findings, "independent checker timed out; findings are unverified"
     overall, verdict = aggregator.score(findings)
@@ -204,5 +212,5 @@ pipeline = build_graph()
 async def run_review(ctx: TaskContext, context: dict[str, Any], options: ctxmod.Options) -> tuple[Review, dict[str, str]]:
     """Return (review, errors by agent). `context` must hold at least {"config": RepoConfig}."""
     state = await pipeline.ainvoke({"ctx": ctx, "options": options, "context": context,
-                                    "findings_by_agent": {}, "agent_errors": {}})
+                                    "findings_by_agent": {}, "agent_errors": {}, "agent_notes": {}})
     return state["review"], state.get("agent_errors") or {}

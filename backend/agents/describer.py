@@ -90,7 +90,12 @@ async def run(ctx: TaskContext, context: dict[str, Any], options: ctxmod.Options
         section = markdown(description, ctx.head_sha, model)
         try:
             if cfg.describe.publish == "body":
-                author = strip_section(context.get("body", ""))
+                # Re-read now: the author may have edited the body during the model call, and the PATCH replaces it all.
+                fresh = await gateway.call(ctxmod.ORCHESTRATOR, ctx, "get_pull_request",
+                                           {"repo": ctx.repo_full_name, "pull_number": ctx.pr_number})
+                current = fresh.data.get("body", "") if not isinstance(fresh, Denial) and isinstance(fresh.data, dict) \
+                    else context.get("body", "")
+                author = strip_section(current)
                 body = f"{author}\n\n{START}\n{section}\n{END}" if author else f"{START}\n{section}\n{END}"
                 res = await gateway.call(AGENT_ID, ctx, "update_pull_request_body",
                                          {"repo": ctx.repo_full_name, "pull_number": ctx.pr_number, "body": body})

@@ -56,7 +56,8 @@ roles:
       - tool: create_pull_request_review
         where: { repo: "{task.repo}", pull_number: "{task.pr_number}", event: [COMMENT, REQUEST_CHANGES] }
       - tool: create_pull_request_review
-        where: { repo: "{task.repo}", pull_number: "{task.pr_number}", event: APPROVE }
+        # Pinned to the reviewed commit: without commit_id GitHub approves whatever the head is now.
+        where: { repo: "{task.repo}", pull_number: "{task.pr_number}", event: APPROVE, commit_id: "{task.head_sha}" }
         requires: human_approved
 
   # /describe: the PR body between PRGuard's markers, or a persistent comment.

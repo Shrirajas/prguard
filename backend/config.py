@@ -63,8 +63,13 @@ class Settings:
     llm_cache: bool = field(default_factory=lambda: _flag("LLM_CACHE", False))
 
     # ---- GitHub ----------------------------------------------------------
-    # github = real GitHub REST API, mock = offline fixtures from demo_target/.
+    # github = real GitHub REST API, mock = offline fixtures from demo_target/,
+    # local = your own git working tree vs its base branch (set by `--local`, read-only).
     upstream: str = field(default_factory=lambda: _env("UPSTREAM", "github").lower())
+    local_dir: str = ""
+    local_base: str = ""
+    local_files: list[str] = field(default_factory=list)  # --file: review only these changed files
+    local_since: str = ""  # --since: review only what changed after this snapshot tree or commit
     github_token: str = field(default_factory=lambda: _env("GITHUB_TOKEN"))
     # GitHub Actions sets both; for GitHub Enterprise Server use https://ghe.example.com/api/v3.
     github_api_url: str = field(default_factory=lambda: _env("GITHUB_API_URL", "https://api.github.com").rstrip("/"))
@@ -91,6 +96,8 @@ class Settings:
     node_timeout_s: float = field(default_factory=lambda: float(_env("NODE_TIMEOUT_S") or 300))
 
     runs_dir: Path = field(default_factory=lambda: Path(_env("RUNS_DIR") or ROOT / "runs"))
+    # One stderr line per pipeline step, so the VS Code extension can show live progress.
+    progress: bool = field(default_factory=lambda: _flag("PRGUARD_PROGRESS", False))
     policy_path: Path = field(default_factory=lambda: Path(_env("POLICY_PATH") or ROOT / "backend" / "policies" / "prguard.policy.yaml"))
     demo_target_dir: Path = ROOT / "demo_target"
     ui_dist_dir: Path = field(default_factory=lambda: Path(_env("UI_DIST_DIR") or ROOT / "frontend" / "dist"))

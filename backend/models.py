@@ -113,6 +113,7 @@ class CommandResult(BaseModel):
 EventType = Literal[
     "span.start",
     "span.end",
+    "span.progress",  # payload: node, done, total (a reviewer's prompts for a batched review)
     "tool.call",
     "decision",
     "finding",

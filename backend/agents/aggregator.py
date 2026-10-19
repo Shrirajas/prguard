@@ -19,6 +19,8 @@ _RANK = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
 # "information-leakage", "environment-leak"), so findings are grouped by topic.
 # First match wins; checked against the category, then the summary.
 _TOPICS: list[tuple[str, tuple[str, ...]]] = [
+    # Before prompt-injection, whose broad "injection" would swallow "config-injection".
+    ("code-execution", ("config-injection", "config injection", "pylintrc")),
     ("prompt-injection", ("injection", "manipulat", "ai reviewer")),
     ("ci-failure", ("ci-fail", "ci fail", "failing test", "test failure")),
     ("docs", ("docstring", "documentation", "undocumented", "missing-doc")),

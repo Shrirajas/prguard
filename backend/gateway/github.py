@@ -23,7 +23,7 @@ from backend.models import UpstreamError
 
 log = logging.getLogger("prguard.github")
 
-MAX_FILES = 300          # GitHub's PR files API stops at 3000; reviews of more are not useful
+MAX_FILES = 3000         # GitHub's PR files API limit; fetch them all so the report can name what was left out
 MAX_COMMENT_PAGES = 10   # look for our persistent comment in the first 1000 comments
 
 
@@ -55,10 +55,12 @@ class GitHubUpstream:
                     response = await client.request(method, self.api + path, headers=self._headers(accept), **kwargs)
                 except httpx.HTTPError as exc:
                     last = f"network error: {type(exc).__name__}"
+                    if method == "POST" and not isinstance(exc, httpx.ConnectError):
+                        break  # GitHub may have created it already; a retry would post it twice
                     await asyncio.sleep(1.5 * (attempt + 1))
                     continue
-                if response.status_code in (502, 503, 504) or (
-                        response.status_code == 403 and response.headers.get("x-ratelimit-remaining") == "0"):
+                rate_limited = response.status_code == 403 and response.headers.get("x-ratelimit-remaining") == "0"
+                if rate_limited or (response.status_code in (502, 503, 504) and method != "POST"):
                     last = f"GitHub {response.status_code}"
                     await asyncio.sleep(3 * (attempt + 1))
                     continue

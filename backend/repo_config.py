@@ -114,8 +114,9 @@ def parse(text: str, source: str = ".prguard.toml") -> RepoConfig:
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
-        cfg.warnings.append(f"{source} is not valid TOML ({exc}); using defaults")
+        cfg.warnings.append(f"{source} is not valid TOML ({exc}); using defaults with fail_on_error = true")
         cfg.source = "defaults"
+        cfg.gate.fail_on_error = True  # fail closed: a typo must not let a model outage pass a repo that asked to fail
         return cfg
     for section, value in data.items():
         if section == "ignore":

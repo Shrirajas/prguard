@@ -56,13 +56,17 @@ async def test_hijacked_reviewer_is_contained(upstream):
 
 def test_approve_needs_human_and_is_scoped_to_one_pr(upstream, engine):
     ctx = make_ctx(upstream)
-    args = {"repo": ctx.repo_full_name, "pull_number": 2, "event": "APPROVE"}
+    args = {"repo": ctx.repo_full_name, "pull_number": 2, "event": "APPROVE", "commit_id": ctx.head_sha}
     assert not engine.evaluate("prguard-aggregator", ctx, "create_pull_request_review", args).allowed
     approved = ctx.model_copy(update={"human_approved": True})
     assert engine.evaluate("prguard-aggregator", approved, "create_pull_request_review", args).allowed
     assert not engine.evaluate("prguard-aggregator", approved, "create_pull_request_review", {**args, "pull_number": 1}).allowed
     assert not engine.evaluate("prguard-security", approved, "create_pull_request_review", args).allowed
     assert not engine.evaluate("prguard-aggregator", approved, "merge_pull_request", args).allowed
+    # An approval must name the reviewed commit, so it cannot land on a head pushed after the review.
+    assert not engine.evaluate("prguard-aggregator", approved, "create_pull_request_review", {**args, "commit_id": "f" * 40}).allowed
+    assert not engine.evaluate("prguard-aggregator", approved, "create_pull_request_review",
+                               {k: v for k, v in args.items() if k != "commit_id"}).allowed
 
 
 def test_reviewer_reads_only_the_pr_head_and_never_secrets(upstream, engine):
